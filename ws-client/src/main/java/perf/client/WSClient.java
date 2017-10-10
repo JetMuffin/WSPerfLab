@@ -1,5 +1,6 @@
 package perf.client;
 
+import graphite.SimpleGraphiteClient;
 import io.netty.buffer.ByteBuf;
 import io.reactivex.netty.client.PoolExhaustedException;
 import io.reactivex.netty.protocol.http.client.HttpClient;
@@ -35,6 +36,7 @@ public class WSClient {
         Options options = new Options();
         options.addOption("j", false, "output JSON");
         options.addOption("o", true, "output file path");
+        options.addOption("g", true, "graphite address");
         options.addOption("p", "port", true, "port");
         options.addOption("h", "host", true, "host");
         options.addOption("f", "step", true, "first step");
@@ -90,6 +92,9 @@ public class WSClient {
             if (cmd.hasOption("o"))
                 client.setOutputPath(cmd.getOptionValue("o"));
 
+            if (cmd.hasOption("g"))
+                client.setEnableGraphiteReport(cmd.getOptionValue("g"));
+
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
         }
@@ -105,7 +110,9 @@ public class WSClient {
     final int firstStep; // starting point (1 == 1000rps, 2 == 2000rps)
 
     private boolean enableJsonLogging;
+    private boolean enableGraphiteReport;
     String outputPath;
+    SimpleGraphiteClient graphiteClient;
     OutputStream statsOutputStream;
 
     static final int rollingSeconds = 5;
@@ -165,6 +172,22 @@ public class WSClient {
         return this;
     }
 
+    WSClient setEnableGraphiteReport(String address) {
+        String host;
+        int port;
+        try {
+            String[] splits = address.split(":");
+            host = splits[0];
+            port = Integer.parseInt(splits[1]);
+            this.graphiteClient = new SimpleGraphiteClient(host, port);
+            this.enableGraphiteReport = true;
+        } catch (Exception e) {
+            this.graphiteClient = null;
+        }
+
+        return this;
+    }
+
     WSClient setOutputPath(String s) {
         this.outputPath = s;
         return this;
@@ -183,7 +206,7 @@ public class WSClient {
         Observable<Observable<Long>> stepIntervals = Observable.timer(0, stepDuration, TimeUnit.SECONDS).map(l -> l + firstStep)
                 .map(step -> {
                     long rps = step * stepSize;
-                    long interval = TimeUnit.SECONDS.toMicros(1) / rps;
+                    long interval = TimeUnit.SECONDS.toMicros(1) / 3;
                     StringBuilder str = new StringBuilder();
                     str.append('\n');
                     str.append("########################################################################################").append(
@@ -225,7 +248,7 @@ public class WSClient {
     private void startMonitoring() {
         final byte[] newlineBytes = "\n".getBytes();
 
-        Observable.interval(5, TimeUnit.SECONDS).doOnNext(l -> {
+        Observable.interval(15, TimeUnit.SECONDS).doOnNext(l -> {
             StringBuilder msg = new StringBuilder();
             msg.append("Total => ");
             msg.append("  Success: ").append(counter.getCumulativeSum(CounterEvent.SUCCESS));
@@ -249,6 +272,21 @@ public class WSClient {
             n.append("  AcqReq: ").append(stats.getPendingAcquire());
             n.append("  RelReq: ").append(stats.getPendingRelease());
             System.out.println(n.toString());
+
+            if (enableGraphiteReport) {
+                try {
+                    Map<String, Integer> allAnswers = new HashMap<String, Integer>() {{
+                        put("datom.tomcat.latency.50th", latency.getPercentile(50.0));
+                        put("datom.tomcat.latency.90th", latency.getPercentile(90.0));
+                        put("datom.tomcat.latency.99th", latency.getPercentile(99.0));
+                        put("datom.tomcat.latency.999th", latency.getPercentile(99.9));
+                        put("datom.tomcat.latency.10th", latency.getPercentile(100.0));
+                    }};
+                    graphiteClient.sendMetrics(allAnswers);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
 
             if (enableJsonLogging) {
                 try {
